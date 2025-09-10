@@ -169,11 +169,16 @@ def predict_fn(input_object: Dict[str, Any], model_bundle):
     model = model.to(device)
     with torch.no_grad():
         xb = torch.from_numpy(X).to(device)
-        logits = model(xb)  # [W, 2]
-        probs = F.softmax(logits, dim=-1)[:, 1].detach().cpu().numpy()
-
-    labels = (probs >= threshold).astype(int).tolist()
-    return {"probs": probs.tolist(), "labels": labels, "threshold": threshold}
+        output = model(xb)
+        if meta.get("model_type") == "lstm_regressor":
+            preds = output.detach().cpu().numpy().flatten()
+            labels = (preds >= threshold).astype(int).tolist()
+            return {"preds": preds.tolist(), "labels": labels, "threshold": threshold}
+        else:
+            logits = output  # [W, 2]
+            probs = F.softmax(logits, dim=-1)[:, 1].detach().cpu().numpy()
+            labels = (probs >= threshold).astype(int).tolist()
+            return {"probs": probs.tolist(), "labels": labels, "threshold": threshold}
 
 
 def output_fn(prediction: Dict[str, Any], accept: str = "application/json"):

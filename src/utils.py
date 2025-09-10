@@ -251,33 +251,19 @@ def load_meta(model_dir_or_path: str) -> Dict:
 def load_model_bundle(model_dir: str):
     """
     Returns (model.eval(), scaler_or_None, meta_dict).
-    Requires a models.py with LSTMClassifier in the Python path.
+    Requires a models.py with LSTMClassifier/LSTMRegressor in the Python path.
     """
     try:
-        from models import LSTMClassifier  # late import
+        from models import build_model_from_meta  # late import
     except Exception as e:
         raise SystemExit(
-            "Could not import LSTMClassifier from models.py. Ensure models.py is on PYTHONPATH.\n"
+            "Could not import build_model_from_meta from models.py. Ensure models.py is on PYTHONPATH.\n"
             f"Underlying error: {e}"
         )
 
     meta = load_meta(model_dir)
-    feature_cols = list(meta.get("feature_cols", DEFAULT_FEATURE_COLS))
-    hidden_size = int(meta.get("hidden_size", 512))
-    num_layers = int(meta.get("num_layers", 3))
-    dropout = float(meta.get("dropout", 0.3))
-    bidirectional = bool(meta.get("bidirectional", True))
-    num_classes = int(meta.get("num_classes", 2))
 
-    # window_size is not needed to construct the model; features length is
-    model = LSTMClassifier(
-        input_size=len(feature_cols),
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-        dropout=dropout,
-        bidirectional=bidirectional,
-        num_classes=num_classes,
-    )
+    model = build_model_from_meta(meta)
 
     weights_path = Path(model_dir) / meta.get("model_state_path", "model.pt")
     if not weights_path.exists():

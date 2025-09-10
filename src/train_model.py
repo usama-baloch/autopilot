@@ -169,20 +169,27 @@ def _stream_rows(files: List[Path], chunksize: int = 500_000, overlap: int = 256
                 tail = chunk
     # no final yield
 
-def _make_labels(df: pd.DataFrame, price_col: str) -> np.ndarray:
-    nxt = df[price_col].shift(-1)
-    label = (nxt > df[price_col]).astype(np.int64)
-    label.iloc[-1] = 0
-    return label.to_numpy(dtype=np.int64)
+def _make_labels(df: pd.DataFrame, price_col: str, regression: bool = False) -> np.ndarray:
+    if regression:
+        nxt = df[price_col].shift(-1)
+        label = (nxt - df[price_col]) / df[price_col]  # return
+        label.iloc[-1] = 0.0
+        return label.to_numpy(dtype=np.float32)
+    else:
+        nxt = df[price_col].shift(-1)
+        label = (nxt > df[price_col]).astype(np.int64)
+        label.iloc[-1] = 0
+        return label.to_numpy(dtype=np.int64)
 
 class StreamWindowDataset(torch.utils.data.IterableDataset):
     def __init__(self, files: List[Path], feature_cols: List[str], price_col: str,
-                 window_size: int, chunksize: int = 500_000, overlap: int = 256):
+                  window_size: int, regression: bool = False, chunksize: int = 500_000, overlap: int = 256):
         super().__init__()
         self.files = files
         self.feature_cols = feature_cols
         self.price_col = price_col
         self.window = window_size
+        self.regression = regression
         self.chunksize = chunksize
         self.overlap = max(overlap, window_size + 1)
 
@@ -190,14 +197,18 @@ class StreamWindowDataset(torch.utils.data.IterableDataset):
         buf: Deque[np.ndarray] = deque(maxlen=self.window)
         for df in _stream_rows(self.files, chunksize=self.chunksize, overlap=self.overlap):
             feats = df[self.feature_cols].astype(np.float32, copy=False).to_numpy()
-            labels = _make_labels(df, self.price_col)
+            labels = _make_labels(df, self.price_col, self.regression)
             for i in range(len(df)):
                 buf.append(feats[i])
                 if len(buf) < self.window:
                     continue
                 Xw = np.stack(list(buf), axis=0)
-                y = int(labels[i])
-                yield torch.from_numpy(Xw).float(), torch.tensor(y, dtype=torch.long)
+                if self.regression:
+                    y = float(labels[i])
+                    yield torch.from_numpy(Xw).float(), torch.tensor(y, dtype=torch.float)
+                else:
+                    y = int(labels[i])
+                    yield torch.from_numpy(Xw).float(), torch.tensor(y, dtype=torch.long)
 
 @dataclass
 class TrainConfig:
@@ -220,11 +231,13 @@ class TrainConfig:
     amp: bool
     workers: int
     chunksize: int
+    regression: bool
 
-class LSTMClassifier(nn.Module):
+class LSTMModel(nn.Module):
     def __init__(self, input_size: int, hidden_size: int, num_layers: int,
-                 dropout: float, bidirectional: bool):
+                 dropout: float, bidirectional: bool, num_classes: int = 2, regression: bool = False):
         super().__init__()
+        self.regression = regression
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
@@ -234,12 +247,13 @@ class LSTMClassifier(nn.Module):
             batch_first=True,
         )
         d = 2 if bidirectional else 1
+        output_size = 1 if regression else num_classes
         self.head = nn.Sequential(
             nn.LayerNorm(hidden_size * d),
             nn.Linear(hidden_size * d, hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(p=dropout),
-            nn.Linear(hidden_size // 2, 2),
+            nn.Linear(hidden_size // 2, output_size),
         )
 
     def forward(self, x):
@@ -248,7 +262,11 @@ class LSTMClassifier(nn.Module):
             h = torch.cat([h_n[-2], h_n[-1]], dim=-1)
         else:
             h = h_n[-1]
-        return self.head(h)
+        out = self.head(h)
+        if self.regression:
+            return out.squeeze(-1)  # [B]
+        else:
+            return out  # [B, C]
 
 def _split_stream(files: List[Path], val_frac: float) -> Tuple[List[Path], List[Path]]:
     if len(files) == 1:
@@ -305,27 +323,32 @@ def train(cfg: TrainConfig):
         return xb, yb
 
     train_files, val_files = _split_stream(files, cfg.val_frac if len(files) > 1 else 0.1)
-    train_ds = StreamWindowDataset(train_files, feature_cols, cfg.price_col, window_size, chunksize=cfg.chunksize)
-    val_ds   = StreamWindowDataset(val_files,   feature_cols, cfg.price_col, window_size, chunksize=cfg.chunksize)
+    train_ds = StreamWindowDataset(train_files, feature_cols, cfg.price_col, window_size, cfg.regression, cfg.chunksize)
+    val_ds   = StreamWindowDataset(val_files,   feature_cols, cfg.price_col, window_size, cfg.regression, cfg.chunksize)
 
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, num_workers=cfg.workers,
                               pin_memory=(device.type == "cuda"), collate_fn=collate_batch)
     val_loader   = DataLoader(val_ds, batch_size=cfg.batch_size, num_workers=max(0, cfg.workers // 2),
                               pin_memory=(device.type == "cuda"), collate_fn=collate_batch)
 
-    model = LSTMClassifier(
+    model = LSTMModel(
         input_size=len(feature_cols),
         hidden_size=hidden_size,
         num_layers=num_layers,
         dropout=dropout,
         bidirectional=bidirectional,
+        num_classes=2,
+        regression=cfg.regression,
     ).to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    if cfg.regression:
+        criterion = nn.MSELoss()
+    else:
+        criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     scaler_obj = torch.cuda.amp.GradScaler(enabled=(cfg.amp and device.type == "cuda"))
 
-    best_val = -1.0
+    best_val = float('inf') if cfg.regression else -1.0
     best_state = None
 
     for epoch in range(1, cfg.epochs + 1):
@@ -338,8 +361,8 @@ def train(cfg: TrainConfig):
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
-                logits = model(xb)
-                loss = criterion(logits, yb)
+                output = model(xb)
+                loss = criterion(output, yb)
 
             if scaler_obj.is_enabled():
                 scaler_obj.scale(loss / cfg.accumulate).backward()
@@ -361,24 +384,40 @@ def train(cfg: TrainConfig):
             step += 1
 
         model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb = xb.to(device, non_blocking=True)
-                yb = yb.to(device, non_blocking=True)
-                with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
-                    logits = model(xb)
-                pred = logits.argmax(dim=-1)
-                correct += (pred == yb).sum().item()
-                total += yb.numel()
+        if cfg.regression:
+            val_loss = 0.0
+            total = 0
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    xb = xb.to(device, non_blocking=True)
+                    yb = yb.to(device, non_blocking=True)
+                    with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
+                        pred = model(xb)
+                    val_loss += criterion(pred, yb).item() * yb.numel()
+                    total += yb.numel()
+            val_metric = val_loss / max(1, total)
+            better = val_metric < best_val
+        else:
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    xb = xb.to(device, non_blocking=True)
+                    yb = yb.to(device, non_blocking=True)
+                    with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
+                        logits = model(xb)
+                    pred = logits.argmax(dim=-1)
+                    correct += (pred == yb).sum().item()
+                    total += yb.numel()
+            val_metric = correct / max(1, total)
+            better = val_metric > best_val
 
-        val_acc = correct / max(1, total)
-        if val_acc > best_val:
-            best_val = val_acc
+        if better:
+            best_val = val_metric
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
 
-        print(f"Epoch {epoch}/{cfg.epochs} - train_loss={running/max(1, step):.4f} val_acc={val_acc:.4f}")
+        metric_name = "val_mse" if cfg.regression else "val_acc"
+        print(f"Epoch {epoch}/{cfg.epochs} - train_loss={running/max(1, step):.4f} {metric_name}={val_metric:.4f}")
 
     outdir = Path(cfg.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -394,37 +433,64 @@ def train(cfg: TrainConfig):
 
     # Write meta that exactly matches the checkpoint
     meta = dict(meta_existing)  # start from any existing settings
-    meta.update({
-        "model_type": "lstm_classifier",
-        "framework": "pytorch",
-        "feature_scaling": True,
-        "scaler_type": "standard",
-        "feature_cols": feature_cols,
-        "label_def": "next_bar_up",
-        "num_classes": 2,
-        "price_col": cfg.price_col,
-        "window_size": window_size,
-        "input_size": len(feature_cols),
-        "hidden_size": hidden_size,
-        "num_layers": num_layers,
-        "dropout": dropout,
-        "bidirectional": bidirectional,
-        "buy_threshold": meta.get("buy_threshold", 0.60),
-        "sell_threshold": meta.get("sell_threshold", 0.60),
-        "tx_cost": meta.get("tx_cost", 0.0008),
-        "model_state_path": "model.pt",
-        "last_model_state_path": "model_last.pt",
-        "scaler_path": "scaler.joblib",
-        "notes": "Binary classification (1=buy, 0=no-trade). Streaming trainer with meta-locked features.",
-    })
+    if cfg.regression:
+        meta.update({
+            "model_type": "lstm_regressor",
+            "framework": "pytorch",
+            "feature_scaling": True,
+            "scaler_type": "standard",
+            "feature_cols": feature_cols,
+            "label_def": "next_bar_return",
+            "output_size": 1,
+            "price_col": cfg.price_col,
+            "window_size": window_size,
+            "input_size": len(feature_cols),
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "dropout": dropout,
+            "bidirectional": bidirectional,
+            "tx_cost": meta.get("tx_cost", 0.0008),
+            "model_state_path": "model.pt",
+            "last_model_state_path": "model_last.pt",
+            "scaler_path": "scaler.joblib",
+            "notes": "Regression for next bar return. Streaming trainer with meta-locked features.",
+        })
+    else:
+        meta.update({
+            "model_type": "lstm_classifier",
+            "framework": "pytorch",
+            "feature_scaling": True,
+            "scaler_type": "standard",
+            "feature_cols": feature_cols,
+            "label_def": "next_bar_up",
+            "num_classes": 2,
+            "price_col": cfg.price_col,
+            "window_size": window_size,
+            "input_size": len(feature_cols),
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "dropout": dropout,
+            "bidirectional": bidirectional,
+            "buy_threshold": meta.get("buy_threshold", 0.60),
+            "sell_threshold": meta.get("sell_threshold", 0.60),
+            "tx_cost": meta.get("tx_cost", 0.0008),
+            "model_state_path": "model.pt",
+            "last_model_state_path": "model_last.pt",
+            "scaler_path": "scaler.joblib",
+            "notes": "Binary classification (1=buy, 0=no-trade). Streaming trainer with meta-locked features.",
+        })
     meta_path.write_text(json.dumps(meta, indent=2))
 
-    (outdir / "training_summary.json").write_text(json.dumps({
-        "val_acc_best": best_val,
+    summary = {
         "feature_cols": feature_cols,
         "num_params": sum(p.numel() for p in model.parameters()),
         "config": vars(cfg) | {"meta_path": str(meta_path)},
-    }, indent=2))
+    }
+    if cfg.regression:
+        summary["val_mse_best"] = best_val
+    else:
+        summary["val_acc_best"] = best_val
+    (outdir / "training_summary.json").write_text(json.dumps(summary, indent=2))
 
     print(f"Saved: {model_path}, {last_path}, scaler=True, meta={meta_path}")
 
@@ -458,6 +524,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=0)
     p.add_argument("--chunksize", type=int, default=500_000)
     p.add_argument("--price-col", type=str, default="close")
+    p.add_argument("--regression", type=str2bool, default=False, help="Train regression model for return prediction")
     return p
 
 def main():
@@ -486,6 +553,7 @@ def main():
         amp=args.amp,
         workers=args.workers,
         chunksize=args.chunksize,
+        regression=args.regression,
     )
     train(cfg)
 

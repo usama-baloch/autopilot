@@ -70,12 +70,56 @@ def _align_ohlc(df: pd.DataFrame, price_col: str, window_size: int) -> Tuple[np.
     closes= df[price_col].to_numpy(dtype=float)[window_size - 1:]
     return opens, highs, lows, closes
 
-def _predict_probs(model, scaler, X: np.ndarray, device: str) -> np.ndarray:
+def _predict_probs(model, scaler, X: np.ndarray, device: str, meta: dict) -> np.ndarray:
     with torch.no_grad():
         xb = torch.from_numpy(X).to(device)
-        logits = model(xb)
-        p = F.softmax(logits, dim=-1)[:, 1].detach().cpu().numpy()
-    return p
+        output = model(xb)
+        if meta.get("model_type") == "lstm_regressor":
+            # For regressor, output is the predicted return
+            return output.detach().cpu().numpy().flatten()
+        else:
+            # For classifier, output is logits
+            p = F.softmax(output, dim=-1)[:, 1].detach().cpu().numpy()
+            return p
+
+
+def _forecast_multi_step(model, scaler, X_last: np.ndarray, device: str, meta: dict, steps: int = 3) -> np.ndarray:
+    """
+    Forecast multiple steps ahead by iteratively predicting and updating the window.
+    Assumes regressor model.
+    """
+    if meta.get("model_type") != "lstm_regressor":
+        raise ValueError("Multi-step forecasting requires regressor model")
+
+    window_size = int(meta.get("window_size", 150))
+    feature_cols = meta.get("feature_cols", [])
+    price_col_idx = feature_cols.index(meta.get("price_col", "close")) if meta.get("price_col") in feature_cols else -1
+
+    forecasts = []
+    current_window = X_last[-1].copy()  # Last window [T, F]
+
+    for step in range(steps):
+        with torch.no_grad():
+            xb = torch.from_numpy(current_window[np.newaxis, :, :]).to(device)  # [1, T, F]
+            pred_return = model(xb).item()
+
+        forecasts.append(pred_return)
+
+        # Update window: shift left, append new features
+        # For simplicity, assume features are updated with predicted price
+        if price_col_idx >= 0:
+            current_price = current_window[-1, price_col_idx]
+            new_price = current_price * (1 + pred_return)
+            new_window = np.roll(current_window, -1, axis=0)
+            new_window[-1] = current_window[-1].copy()  # Copy last features
+            new_window[-1, price_col_idx] = new_price  # Update price
+            # Update return feature if present
+            return_idx = feature_cols.index("return") if "return" in feature_cols else -1
+            if return_idx >= 0:
+                new_window[-1, return_idx] = pred_return
+            current_window = new_window
+
+    return np.array(forecasts)
 
 
 # ---------------------------
@@ -196,9 +240,13 @@ def main():
 
     # Load model + meta
     model, scaler, meta = load_model_bundle(args.model_dir)
+    is_regressor = meta.get("model_type") == "lstm_regressor"
     feature_cols = list(meta.get("feature_cols", []))
     window_size = int(meta.get("window_size", 150))
-    threshold = float(meta.get("buy_threshold", 0.60)) if args.threshold is None else float(args.threshold)
+    if is_regressor:
+        threshold = float(meta.get("buy_threshold", 0.001)) if args.threshold is None else float(args.threshold)  # return threshold
+    else:
+        threshold = float(meta.get("buy_threshold", 0.60)) if args.threshold is None else float(args.threshold)
     fee_pct = float(meta.get("tx_cost", 0.0008)) if args.fee_pct is None else float(args.fee_pct)
     tp_pct = 0.005 if args.tp_pct is None else float(args.tp_pct)
     sl_pct = 0.0025 if args.sl_pct is None else float(args.sl_pct)
@@ -232,7 +280,8 @@ def main():
             print(f"[REAL] Binance connected. symbol={args.symbol} base={base_ccy} quote={quote_ccy} testnet={testnet_flag}")
             print(f"[REAL] Entry sizing: alloc-pct={args.alloc_pct:.2%} of available {quote_ccy}")
 
-    print(f"[LIVE] Mode: {'REAL' if real_mode else 'PAPER'} | threshold={threshold:.2f} tp={tp_pct:.4%} sl={sl_pct:.4%} "
+    metric = "return" if is_regressor else "prob"
+    print(f"[LIVE] Mode: {'REAL' if real_mode else 'PAPER'} | threshold={threshold:.4f} ({metric}) tp={tp_pct:.4%} sl={sl_pct:.4%} "
           f"{'' if real_mode else f'fee={fee_pct:.4%}'}")
 
     while True:
@@ -273,12 +322,22 @@ def main():
                 time.sleep(args.interval)
                 continue
 
-            probs = _predict_probs(model, scaler, X, device)
+            probs = _predict_probs(model, scaler, X, device, meta)
             prob_last = float(probs[-1])
+
+            # For regressor, forecast 1-3 minutes
+            if is_regressor:
+                forecasts = _forecast_multi_step(model, scaler, X, device, meta, steps=3)
+                forecast_1m = forecasts[0]
+                forecast_3m = np.prod(1 + forecasts) - 1  # Cumulative return over 3 minutes
+            else:
+                forecasts = None
+                forecast_1m = None
+                forecast_3m = None
 
             # ---- Trading logic ----
             if not in_trade:
-                if prob_last >= threshold:
+                if (is_regressor and prob_last > threshold) or (not is_regressor and prob_last >= threshold):
                     # ENTRY
                     if real_mode:
                         # Determine notional using alloc-pct of available quote balance
@@ -305,7 +364,11 @@ def main():
                                 in_trade = True
                                 if not args.quiet:
                                     oid = order.get("id", "—")
-                                    print(f"[REAL] BUY  {args.symbol} qty={held_amount} @ {fmt_money(entry_price)}  (prob={prob_last:.3f}) id={oid}")
+                                    if is_regressor:
+                                        val_str = f"return={prob_last:.4f} 1m={forecast_1m:.4f} 3m={forecast_3m:.4f}"
+                                    else:
+                                        val_str = f"prob={prob_last:.3f}"
+                                    print(f"[REAL] BUY  {args.symbol} qty={held_amount} @ {fmt_money(entry_price)}  ({val_str}) id={oid}")
                     else:
                         # PAPER: enter at next bar open (conservative)
                         entry_price = float(opens[-1])
@@ -314,7 +377,11 @@ def main():
                         cash *= (1.0 - float(os.getenv("PAPER_FEE_PCT", fee_pct)))  # pay entry fee
                         in_trade = True
                         if not args.quiet:
-                            print(f"[PAPER] BUY  @ {fmt_money(entry_price)}  (prob={prob_last:.3f})  equity={fmt_money(cash)}")
+                            if is_regressor:
+                                val_str = f"return={prob_last:.4f} 1m={forecast_1m:.4f} 3m={forecast_3m:.4f}"
+                            else:
+                                val_str = f"prob={prob_last:.3f}"
+                            print(f"[PAPER] BUY  @ {fmt_money(entry_price)}  ({val_str})  equity={fmt_money(cash)}")
 
             else:
                 # EXIT checks using current bar hi/lo

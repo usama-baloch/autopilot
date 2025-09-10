@@ -81,6 +81,58 @@ class LSTMClassifier(nn.Module):
         return logits
 
 
+class LSTMRegressor(nn.Module):
+    """
+    Generic LSTM regressor that outputs predicted value (e.g., price change).
+    Expects input of shape: [batch, seq_len, input_size] (batch_first=True).
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        bidirectional: bool = False,
+        output_size: int = 1,
+    ):
+        super().__init__()
+        self.save_hyperparameters = {
+            "input_size": input_size,
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "dropout": dropout,
+            "bidirectional": bidirectional,
+            "output_size": output_size,
+        }
+
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
+            batch_first=True,
+        )
+
+        direction_factor = 2 if bidirectional else 1
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_size * direction_factor),
+            nn.Linear(hidden_size * direction_factor, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_size, output_size),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, F]
+        # We take the last hidden state for regression
+        output, (hn, cn) = self.lstm(x)  # output: [B, T, H*D]
+        last = output[:, -1, :]          # [B, H*D]
+        pred = self.head(last)           # [B, output_size]
+        return pred
+
+
 # ----------------------------
 # Metadata utilities
 # ----------------------------
@@ -94,6 +146,7 @@ class ModelMeta:
     dropout: float = 0.1
     bidirectional: bool = False
     num_classes: int = 3
+    output_size: int = 1  # For regressor
 
     # Artifacts (relative to model dir unless absolute)
     model_state_path: str = "model.pt"
@@ -114,6 +167,7 @@ class ModelMeta:
             dropout=float(d.get("dropout", 0.1)),
             bidirectional=bool(d.get("bidirectional", False)),
             num_classes=int(d.get("num_classes", d.get("classes", 3))),
+            output_size=int(d.get("output_size", 1)),
             model_state_path=str(d.get("model_state_path", d.get("weights", "model.pt"))),
             scaler_path=d.get("scaler_path", d.get("scaler", "scaler.joblib")),
             feature_scaling=bool(d.get("feature_scaling", d.get("scale_features", True))),
@@ -125,21 +179,31 @@ class ModelMeta:
         return asdict(self)
 
 
-def build_model_from_meta(meta: Union[ModelMeta, Dict[str, Any]]) -> LSTMClassifier:
+def build_model_from_meta(meta: Union[ModelMeta, Dict[str, Any]]) -> Union[LSTMClassifier, LSTMRegressor]:
     """
-    Build an LSTMClassifier instance from metadata dict or ModelMeta object.
+    Build an LSTM model instance from metadata dict or ModelMeta object.
     """
     if not isinstance(meta, ModelMeta):
         meta = ModelMeta.from_dict(meta)
 
-    model = LSTMClassifier(
-        input_size=meta.input_size,
-        hidden_size=meta.hidden_size,
-        num_layers=meta.num_layers,
-        dropout=meta.dropout,
-        bidirectional=meta.bidirectional,
-        num_classes=meta.num_classes,
-    )
+    if meta.model_type == "lstm_regressor":
+        model = LSTMRegressor(
+            input_size=meta.input_size,
+            hidden_size=meta.hidden_size,
+            num_layers=meta.num_layers,
+            dropout=meta.dropout,
+            bidirectional=meta.bidirectional,
+            output_size=meta.output_size,
+        )
+    else:  # default to classifier
+        model = LSTMClassifier(
+            input_size=meta.input_size,
+            hidden_size=meta.hidden_size,
+            num_layers=meta.num_layers,
+            dropout=meta.dropout,
+            bidirectional=meta.bidirectional,
+            num_classes=meta.num_classes,
+        )
     return model
 
 
